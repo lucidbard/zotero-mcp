@@ -7,3 +7,5 @@ venv/
 dist/
 build/
 .env
+node_modules/
+zotero-plugin/dist/
