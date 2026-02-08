@@ -1,0 +1,25 @@
+{
+  "name": "zotero-mcp-bridge",
+  "version": "1.0.0",
+  "description": "HTTP bridge for Zotero MCP server — enables collection management and item access",
+  "scripts": {
+    "build": "node scripts/build.js",
+    "build:dev": "node scripts/build.js --dev",
+    "watch": "node scripts/build.js --watch",
+    "clean": "rimraf build dist",
+    "lint": "eslint addon/content/*.js",
+    "test": "node scripts/test-client.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lucidbard/zotero-mcp.git",
+    "directory": "zotero-plugin"
+  },
+  "author": "lucidbard",
+  "license": "MIT",
+  "devDependencies": {
+    "adm-zip": "^0.5.10",
+    "eslint": "^8.57.0",
+    "rimraf": "^5.0.5"
+  }
+}

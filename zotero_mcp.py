@@ -35,6 +35,7 @@ Configure in Claude Desktop / claude_desktop_config.json:
 """
 
 import asyncio
+import json
 import os
 import re
 import sqlite3
@@ -42,11 +43,44 @@ import sys
 from pathlib import Path
 from typing import Any, Optional, Dict, List
 
+import httpx
+
 from mcp.server import Server
 from mcp.types import (
     Tool,
     TextContent,
 )
+
+
+# ---------------------------------------------------------------------------
+# Zotero MCP Bridge plugin integration
+# ---------------------------------------------------------------------------
+
+PLUGIN_BASE_URL = "http://127.0.0.1:23119"
+PLUGIN_RPC_URL = f"{PLUGIN_BASE_URL}/zotero-mcp/rpc"
+PLUGIN_HEALTH_URL = f"{PLUGIN_BASE_URL}/zotero-mcp/health"
+
+
+async def _plugin_available() -> bool:
+    """Check if the Zotero MCP Bridge plugin is running."""
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(PLUGIN_HEALTH_URL, timeout=2.0)
+            return r.status_code == 200
+    except Exception:
+        return False
+
+
+async def _plugin_rpc(method: str, params: dict = None) -> dict:
+    """Call the Zotero MCP Bridge plugin's RPC endpoint."""
+    async with httpx.AsyncClient() as client:
+        r = await client.post(
+            PLUGIN_RPC_URL,
+            json={"method": method, "params": params or {}},
+            timeout=10.0,
+        )
+        r.raise_for_status()
+        return r.json()
 
 
 # ---------------------------------------------------------------------------
@@ -881,7 +915,10 @@ db: Optional[ZoteroDb] = None
 
 @app.list_tools()
 async def list_tools() -> list[Tool]:
-    return [
+    # Check if the Zotero plugin is available for write operations
+    plugin_active = await _plugin_available()
+
+    tools = [
         Tool(
             name="search_papers",
             description=(
@@ -994,6 +1031,79 @@ async def list_tools() -> list[Tool]:
         ),
     ]
 
+    # Add write tools only when the Zotero plugin is available
+    if plugin_active:
+        tools.extend([
+            Tool(
+                name="create_collection",
+                description=(
+                    "Create a new collection in Zotero. "
+                    "Requires the Zotero MCP Bridge plugin to be running in Zotero."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Name for the new collection",
+                        },
+                        "parent_key": {
+                            "type": "string",
+                            "description": "Key of parent collection (optional, for nested collections)",
+                        },
+                    },
+                    "required": ["name"],
+                },
+            ),
+            Tool(
+                name="add_to_collection",
+                description=(
+                    "Add papers to a Zotero collection. "
+                    "Requires the Zotero MCP Bridge plugin to be running in Zotero."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "collection_key": {
+                            "type": "string",
+                            "description": "Key of the target collection",
+                        },
+                        "item_keys": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Array of item keys to add to the collection",
+                        },
+                    },
+                    "required": ["collection_key", "item_keys"],
+                },
+            ),
+            Tool(
+                name="remove_from_collection",
+                description=(
+                    "Remove papers from a Zotero collection. "
+                    "Does not delete the papers, just removes them from the collection. "
+                    "Requires the Zotero MCP Bridge plugin to be running in Zotero."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "collection_key": {
+                            "type": "string",
+                            "description": "Key of the collection",
+                        },
+                        "item_keys": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Array of item keys to remove from the collection",
+                        },
+                    },
+                    "required": ["collection_key", "item_keys"],
+                },
+            ),
+        ])
+
+    return tools
+
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
@@ -1069,6 +1179,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         elif name == "library_stats":
             count = db.item_count()
             collections = db.list_collections()
+            plugin_active = await _plugin_available()
             text = (
                 f"**Zotero Library Statistics**\n\n"
                 f"- Total items: {count}\n"
@@ -1084,6 +1195,53 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             else:
                 text += "- Better BibTeX: not detected\n"
 
+            # Check plugin status
+            if plugin_active:
+                text += "- Zotero MCP Bridge plugin: active (write tools available)\n"
+            else:
+                text += "- Zotero MCP Bridge plugin: not detected (read-only mode)\n"
+
+            return [TextContent(type="text", text=text)]
+
+        elif name == "create_collection":
+            result = await _plugin_rpc("createCollection", {
+                "name": arguments["name"],
+                "parentKey": arguments.get("parent_key"),
+            })
+            text = (
+                f"Created collection **{result['name']}**\n"
+                f"- Key: `{result['key']}`\n"
+            )
+            if result.get("parentKey"):
+                text += f"- Parent: `{result['parentKey']}`\n"
+            return [TextContent(type="text", text=text)]
+
+        elif name == "add_to_collection":
+            result = await _plugin_rpc("addToCollection", {
+                "collectionKey": arguments["collection_key"],
+                "itemKeys": arguments["item_keys"],
+            })
+            added = result.get("added", [])
+            errors = result.get("errors", [])
+            text = f"Added {len(added)} item(s) to collection `{arguments['collection_key']}`.\n"
+            if errors:
+                text += "\nErrors:\n"
+                for err in errors:
+                    text += f"- `{err['key']}`: {err['error']}\n"
+            return [TextContent(type="text", text=text)]
+
+        elif name == "remove_from_collection":
+            result = await _plugin_rpc("removeFromCollection", {
+                "collectionKey": arguments["collection_key"],
+                "itemKeys": arguments["item_keys"],
+            })
+            removed = result.get("removed", [])
+            errors = result.get("errors", [])
+            text = f"Removed {len(removed)} item(s) from collection `{arguments['collection_key']}`.\n"
+            if errors:
+                text += "\nErrors:\n"
+                for err in errors:
+                    text += f"- `{err['key']}`: {err['error']}\n"
             return [TextContent(type="text", text=text)]
 
         else:
